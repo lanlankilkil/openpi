@@ -131,7 +131,14 @@ def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
     """Create a dataset for training."""
-    repo_id = data_config.repo_id
+    if data_config.local_data_dir is not None:
+        local_dir = data_config.local_data_dir
+        if not os.path.exists(local_dir):
+            raise ValueError(f"Local data directory does not exist: {local_dir}")
+        repo_id = local_dir
+    else:
+        repo_id = data_config.repo_id
+    
     if repo_id is None:
         raise ValueError("Repo ID is not set. Cannot create dataset.")
     if repo_id == "fake":
@@ -139,7 +146,7 @@ def create_torch_dataset(
 
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
     dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
+        repo_id,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
