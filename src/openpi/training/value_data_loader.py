@@ -187,7 +187,15 @@ def collate_fn(batch: list[dict]) -> dict:
     result["image_mask"] = {
         key: np.array([item["image_mask"][key] for item in batch], dtype=bool) for key in batch[0]["image_mask"]
     }
-    result["state"] = np.stack([item["state"] for item in batch], axis=0)
+    
+    # 添加文本数据处理
+    result["tokenized_prompt"] = np.stack([item["tokenized_prompt"] for item in batch], axis=0)
+    result["tokenized_prompt_mask"] = np.array([item["tokenized_prompt_mask"] for item in batch], dtype=bool)
+    
+    # Observation类需要state字段，但Value Model不使用，提供空占位符
+    batch_size = len(batch)
+    result["state"] = np.zeros((batch_size, 1), dtype=np.float32)  # 最小占位符
+    
     result["value"] = np.array([item["value"] for item in batch], dtype=np.float32)
 
     return result
