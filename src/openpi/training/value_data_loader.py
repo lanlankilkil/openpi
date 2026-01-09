@@ -35,6 +35,9 @@ class ValueDataset(TorchDataset):
         self.max_token_len = max_token_len
         self.image_size = image_size
 
+        # 加载任务文本信息
+        self._load_task_texts()
+
         parquet_dir = self.data_dir / "data"
         self.parquet_files = sorted(parquet_dir.rglob("*.parquet"))
 
@@ -51,6 +54,51 @@ class ValueDataset(TorchDataset):
 
         self.total_frames = self.episode_offsets[-1]
         logger.info(f"加载 {len(self.parquet_files)} 个 episodes, 共 {self.total_frames} 帧")
+
+    def _load_task_texts(self):
+        """加载任务文本信息。"""
+        import json
+        
+        tasks_file = self.data_dir / "meta" / "tasks.jsonl"
+        if not tasks_file.exists():
+            raise ValueError(f"找不到任务文件: {tasks_file}")
+        
+        self.task_texts = {}
+        with open(tasks_file, 'r') as f:
+            for line in f:
+                task_data = json.loads(line.strip())
+                task_index = task_data["task_index"]
+                task_text = task_data["task"]
+                self.task_texts[task_index] = task_text
+        
+        logger.info(f"加载了 {len(self.task_texts)} 个任务文本")
+
+    def _tokenize_text(self, text: str) -> tuple[np.ndarray, np.ndarray]:
+        """简单的文本tokenization。"""
+        # 添加Value:后缀，明确这是价值估计任务
+        text_with_suffix = f"{text}\nValue:"
+        words = text_with_suffix.lower().split()
+        
+        # 简单映射到数字ID（实际应该使用真正的tokenizer）
+        vocab = {
+            'plug': 1, 'black': 2, 'into': 3, 'the': 4, 'three': 5, 'hole': 6, 'socket': 7,
+            'pull': 8, 'drawer': 9, 'open': 10, 'close': 11, 'push': 12, 'button': 13,
+            'value:': 14, '\nvalue:': 14,  # Value提示符
+            '<pad>': 0, '<unk>': 999
+        }
+        
+        tokens = [vocab.get(word, vocab['<unk>']) for word in words]
+        
+        # 截断或填充到固定长度
+        if len(tokens) > self.max_token_len:
+            tokens = tokens[:self.max_token_len]
+        else:
+            tokens.extend([vocab['<pad>']] * (self.max_token_len - len(tokens)))
+        
+        tokens = np.array(tokens, dtype=np.int32)
+        mask = (tokens != vocab['<pad>']).astype(bool)
+        
+        return tokens, mask
 
     def __len__(self) -> int:
         return self.total_frames
@@ -76,7 +124,13 @@ class ValueDataset(TorchDataset):
         if "wrist_image" in row:
             wrist_image = self._load_image(row["wrist_image"])
 
-        state = np.array(row["state"], dtype=np.float32)
+        # 获取任务文本
+        task_index = int(row["task_index"])
+        task_text = self.task_texts.get(task_index, "unknown task")
+        tokenized_prompt, prompt_mask = self._tokenize_text(task_text)
+
+        # Value model 不需要机器人状态，只需要图像
+        # state = np.array(row["state"], dtype=np.float32)
 
         if "value" not in row:
             raise ValueError("数据中没有 value 字段，请先运行 add_value_labels.py")
@@ -89,7 +143,10 @@ class ValueDataset(TorchDataset):
             "image_mask": {
                 "base_0_rgb": True,
             },
-            "state": state,
+            "tokenized_prompt": tokenized_prompt,
+            "tokenized_prompt_mask": prompt_mask,
+            # Value model 不需要 state
+            # "state": state,
             "value": value,
         }
 

@@ -106,7 +106,7 @@ class ValueModel(nnx.Module):
 
         self.img = nnx_bridge.ToNNX(
             _siglip.Module(
-                num_classes=2048,  # 匹配PaliGemma checkpoint的维度
+                num_classes=1152,  # SigLIP So400m 的实际输出维度
                 variant=config.siglip_variant,
                 pool_type="none",
                 scan=True,
@@ -114,8 +114,8 @@ class ValueModel(nnx.Module):
             )
         )
 
-        # 添加投影层将SigLIP的2048维投影到Gemma的640维
-        self.img_projection = nnx.Linear(2048, gemma_config.width, rngs=rngs)
+        # 添加投影层将SigLIP的1152维投影到Gemma的640维
+        self.img_projection = nnx.Linear(1152, gemma_config.width, rngs=rngs)
 
         self.llm = nnx_bridge.ToNNX(
             _gemma.Module(

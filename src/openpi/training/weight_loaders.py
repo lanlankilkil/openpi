@@ -87,13 +87,13 @@ class ValueModelWeightLoader(WeightLoader):
     def load(self, params: at.Params) -> at.Params:
         logger.info("加载 SigLIP 权重 (from local checkpoint)...")
         #siglip_path = "/data/train_dataset/checkpoint/siglip2-so400m-patch14-384-jax/siglip2_so400m14_384.npz"
-        siglip_path = "./checkpoint/gemma-3-270m"
+        siglip_path = "/public/home/wangsenbao/Robotic_Project/checkpoint/siglip2-so400m-patch14-384-jax/siglip2_so400m14_384.npz"
         with open(siglip_path, "rb") as f:
             siglip_flat = dict(np.load(f, allow_pickle=False))
         siglip_params = flax.traverse_util.unflatten_dict(siglip_flat, sep="/")["params"]
 
         logger.info("加载 Gemma 3 270M 权重 (from local Orbax checkpoint)...")
-        gemma_checkpoint_dir = "/data/train_dataset/checkpoint/gemma-3-270m"
+        gemma_checkpoint_dir = "/public/home/wangsenbao/Robotic_Project/checkpoint/gemma-3-270m"
 
         # 使用 Orbax 加载 checkpoint
         try:
