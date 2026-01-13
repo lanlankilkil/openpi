@@ -9,7 +9,13 @@ import jax
 import jax.numpy as jnp
 
 from openpi.models import model as _model
-import openpi.models.gemma as _gemma
+import sys
+import os
+# 添加 gemma 目录到 Python 路径
+gemma_path = os.path.join(os.path.dirname(__file__), '../../../gemma')
+sys.path.insert(0, gemma_path)
+from gemma.gm.nn._gemma import Gemma3_270M
+from gemma.gm.nn._modules import Embedder
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 
@@ -102,7 +108,8 @@ class ValueModel(nnx.Module):
 
     def __init__(self, config: "ValueModelConfig", rngs: nnx.Rngs):
         self.config = config
-        gemma_config = _gemma.get_config(config.gemma_variant)
+        # 直接使用配置中的 Gemma 配置
+        gemma_config = config.gemma_config
 
         self.img = nnx_bridge.ToNNX(
             _siglip.Module(
@@ -114,24 +121,35 @@ class ValueModel(nnx.Module):
             )
         )
 
-        # 添加投影层将SigLIP的1152维投影到Gemma的640维
-        self.img_projection = nnx.Linear(1152, gemma_config.width, rngs=rngs)
+        # 添加投影层将SigLIP的1152维投影到Gemma3的640维
+        self.img_projection = nnx.Linear(1152, gemma_config.embed_dim, rngs=rngs)
 
+        # 使用正确的Gemma3 270M
         self.llm = nnx_bridge.ToNNX(
-            _gemma.Module(
-                configs=[gemma_config],
-                embed_dtype=config.dtype,
-                adarms=False,
-            )
+            Gemma3_270M()
         )
 
         fake_image = jnp.zeros((1, 224, 224, 3), dtype=jnp.float32)
         self.img.lazy_init(fake_image, train=False, rngs=rngs)
-        self.llm.lazy_init(rngs=rngs, method="init", use_adarms=[False])
+        
+        # 初始化 LLM - 需要提供假的输入来初始化参数
+        fake_tokens = jnp.zeros((1, 10), dtype=jnp.int32)  # batch_size=1, seq_len=10
+        self.llm.lazy_init(fake_tokens, rngs=rngs)
 
-        hidden_dim = gemma_config.width // 2
+        # 添加交叉注意力层：让文本特征关注图像特征
+        self.cross_attention = nnx.MultiHeadAttention(
+            num_heads=8,                        # 8个注意力头
+            in_features=gemma_config.embed_dim, # 640维
+            qkv_features=gemma_config.embed_dim,
+            out_features=gemma_config.embed_dim,
+            decode=False,
+            rngs=rngs,
+        )
+        self.cross_attn_norm = nnx.LayerNorm(gemma_config.embed_dim, rngs=rngs)
+
+        hidden_dim = gemma_config.embed_dim // 2
         self.value_head = ValueHead(
-            input_dim=gemma_config.width,
+            input_dim=gemma_config.embed_dim,
             hidden_dim=hidden_dim,
             output_dim=NUM_ATOMS,
             dropout_rate=0.1,
@@ -144,34 +162,119 @@ class ValueModel(nnx.Module):
     def embed_tokens(
         self, obs: _model.Observation
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
-        """Embed images and text into a single token sequence."""
+        """Embed images and text into a single token sequence with cross-attention."""
         input_mask = []
         ar_mask = []
-        tokens = []
+        image_tokens_list = []
+        image_mask_list = []
 
+        # 处理图像特征
         for name in obs.images:
             image_tokens, _ = self.img(obs.images[name], train=False)
-            # 投影SigLIP特征到Gemma维度
             image_tokens = self.img_projection(image_tokens)
-            tokens.append(image_tokens)
-            input_mask.append(
+            image_tokens_list.append(image_tokens)
+            image_mask_list.append(
                 einops.repeat(
                     obs.image_masks[name],
                     "b -> b s",
                     s=image_tokens.shape[1],
                 )
             )
-            ar_mask += [False] * image_tokens.shape[1]
 
-        if obs.tokenized_prompt is not None:
-            text_tokens = self.llm(obs.tokenized_prompt, method="embed")
-            tokens.append(text_tokens)
-            input_mask.append(obs.tokenized_prompt_mask)
-            ar_mask += [False] * text_tokens.shape[1]
+        # 拼接所有图像特征
+        all_image_tokens = jnp.concatenate(image_tokens_list, axis=1) if image_tokens_list else None
+        all_image_masks = jnp.concatenate(image_mask_list, axis=1) if image_mask_list else None
 
-        tokens = jnp.concatenate(tokens, axis=1)
-        input_mask = jnp.concatenate(input_mask, axis=1)
-        ar_mask = jnp.array(ar_mask)
+        if obs.tokenized_prompt is not None and all_image_tokens is not None:
+            # Gemma3_270M doesn't have embed method, need to manually access embedder
+            _, llm_state = nnx.split(self.llm)
+            llm_params = llm_state.to_pure_dict()
+            
+            # Get embedder params (search in nested structure)
+            embedder_params = None
+            if 'embedder' in llm_params:
+                embedder_params = llm_params['embedder']
+            else:
+                # Search for embedder in nested structure
+                def find_embedder(d, path=""):
+                    if isinstance(d, dict):
+                        for key, value in d.items():
+                            current_path = f"{path}.{key}" if path else key
+                            if key == 'embedder':
+                                return value
+                            elif isinstance(value, dict):
+                                result = find_embedder(value, current_path)
+                                if result is not None:
+                                    return result
+                    return None
+                
+                embedder_params = find_embedder(llm_params)
+            
+            if embedder_params is None:
+                raise ValueError(f"Could not find embedder params in LLM state. Available keys: {list(llm_params.keys())}")
+            
+            # Create embedder and apply encode method
+            vocab_size = self.config.vocab_size
+            embed_dim = self.config.embed_dim
+            embedder = Embedder(vocab_size=vocab_size, embed_dim=embed_dim)
+            text_tokens = embedder.apply({"params": embedder_params}, 
+                                       obs.tokenized_prompt, 
+                                       method=embedder.encode)
+            
+            # 应用交叉注意力：让文本特征关注图像特征
+            text_tokens_normed = self.cross_attn_norm(text_tokens)
+            attended_text = self.cross_attention(
+                text_tokens_normed,   # Query: 文本特征
+                all_image_tokens,     # Key: 图像特征
+                all_image_tokens,     # Value: 图像特征
+            )
+            # 残差连接
+            text_tokens = text_tokens + attended_text
+            
+            # 拼接图像和融合后的文本特征
+            tokens = jnp.concatenate([all_image_tokens, text_tokens], axis=1)
+            input_mask = jnp.concatenate([all_image_masks, obs.tokenized_prompt_mask], axis=1)
+            ar_mask = jnp.array([False] * all_image_tokens.shape[1] + [False] * text_tokens.shape[1])
+        elif obs.tokenized_prompt is not None:
+            # 只有文本，没有图像
+            _, llm_state = nnx.split(self.llm)
+            llm_params = llm_state.to_pure_dict()
+            
+            embedder_params = None
+            if 'embedder' in llm_params:
+                embedder_params = llm_params['embedder']
+            else:
+                def find_embedder(d, path=""):
+                    if isinstance(d, dict):
+                        for key, value in d.items():
+                            if key == 'embedder':
+                                return value
+                            elif isinstance(value, dict):
+                                result = find_embedder(value, path)
+                                if result is not None:
+                                    return result
+                    return None
+                embedder_params = find_embedder(llm_params)
+            
+            if embedder_params is None:
+                raise ValueError(f"Could not find embedder params in LLM state.")
+            
+            vocab_size = self.config.vocab_size
+            embed_dim = self.config.embed_dim
+            embedder = Embedder(vocab_size=vocab_size, embed_dim=embed_dim)
+            text_tokens = embedder.apply({"params": embedder_params}, 
+                                       obs.tokenized_prompt, 
+                                       method=embedder.encode)
+            tokens = text_tokens
+            input_mask = obs.tokenized_prompt_mask
+            ar_mask = jnp.array([False] * text_tokens.shape[1])
+        elif all_image_tokens is not None:
+            # 只有图像，没有文本
+            tokens = all_image_tokens
+            input_mask = all_image_masks
+            ar_mask = jnp.array([False] * all_image_tokens.shape[1])
+        else:
+            raise ValueError("No valid input: both images and text are None")
 
         return tokens, input_mask, ar_mask
 
@@ -187,14 +290,14 @@ class ValueModel(nnx.Module):
         """
         tokens, input_mask, ar_mask = self.embed_tokens(observation)
 
-        attn_mask = make_attn_mask(input_mask, ar_mask)
-        positions = jnp.cumsum(input_mask, axis=1) - 1
-
-        out, _ = self.llm([tokens], mask=attn_mask, positions=positions, adarms_cond=[None])
-
-        last_token_idx = jnp.sum(input_mask, axis=-1) - 1
-        batch_idx = jnp.arange(out[0].shape[0])
-        pooled = out[0][batch_idx, last_token_idx]
+        # Value Model 不需要调用完整的 LLM，而是直接处理嵌入特征
+        # 因为我们已经有了图像和文本的嵌入向量，可以直接池化处理
+        
+        # 对所有 token 进行平均池化（JAX兼容版本）
+        # 使用加权平均池化（根据 mask），添加小的epsilon避免除零
+        mask_expanded = input_mask[..., None]  # [batch, seq, 1]
+        masked_tokens = tokens * mask_expanded  # [batch, seq, embed]
+        pooled = jnp.sum(masked_tokens, axis=1) / (jnp.sum(input_mask, axis=1, keepdims=True) + 1e-8)
 
         return self.value_head(pooled, train=train)
 

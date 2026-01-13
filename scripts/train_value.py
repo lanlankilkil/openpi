@@ -58,20 +58,22 @@ class TrainState:
     params: nnx.State
     model_def: nnx.GraphDef
     opt_state: optax.OptState
+    ema_params: nnx.State | None = None  
 
 
 def create_train_state(
     config: ValueModelConfig,
-    learning_rate: float,
+    num_train_steps: int,
     rng: at.KeyArrayLike,
     load_pretrained: bool = False,
+    ema_decay: float = 0.999,  
 ) -> tuple[TrainState, optax.GradientTransformation]:
     """创建训练状态。"""
     model = config.create(rng)
     params = nnx.state(model)
 
     if load_pretrained:
-        logging.info("加载 PaliGemma 预训练权重...")
+        logging.info("加载 SigLIP + Gemma3-270M 预训练权重...")
         loader = ValueModelWeightLoader()
         params_dict = params.to_pure_dict()
         loaded_params = loader.load(params_dict)
@@ -80,7 +82,35 @@ def create_train_state(
 
     model_def = nnx.graphdef(model)
 
-    tx = optax.adamw(learning_rate, weight_decay=0.01)
+    
+    warmup_steps = min(1000, num_train_steps // 10)  # 前10%步数用于warmup
+    
+    lr_schedule = optax.join_schedules(
+        [
+            optax.linear_schedule(
+                init_value=0.0,
+                end_value=5e-5,  
+                transition_steps=warmup_steps,
+            ),
+            optax.cosine_decay_schedule(
+                init_value=5e-5,
+                decay_steps=num_train_steps - warmup_steps,
+                alpha=0.1, 
+            )
+        ],
+        [warmup_steps]
+    )
+
+    tx = optax.chain(
+        optax.clip_by_global_norm(1.0),  # 梯度裁剪
+        optax.adamw(
+            lr_schedule, 
+            b1=0.9,        # π0优化：更保守的momentum
+            b2=0.95,       # π0优化：更保守的二阶momentum
+            eps=1e-8,      # π0优化：数值稳定性
+            weight_decay=1e-10  # π0优化：极小权重衰减，避免OOM
+        )
+    )
     opt_state = tx.init(params)
 
     return TrainState(
@@ -88,6 +118,7 @@ def create_train_state(
         params=params,
         model_def=model_def,
         opt_state=opt_state,
+        ema_params=jax.tree.map(lambda x: x, params) if ema_decay is not None else None,  # π0优化：初始化EMA
     ), tx
 
 
@@ -97,6 +128,7 @@ def train_step(
     rng: at.KeyArrayLike,
     observation: _model.Observation,
     target: jnp.ndarray,
+    ema_decay: float = 0.999,  # π0优化：EMA衰减率
 ) -> tuple[TrainState, dict[str, jnp.ndarray]]:
     """单步训练。"""
     model = nnx.merge(state.model_def, state.params)
@@ -111,11 +143,21 @@ def train_step(
     updates, new_opt_state = tx.update(grads, state.opt_state, state.params)
     new_params = optax.apply_updates(state.params, updates)
 
+    # π0优化：EMA更新
+    new_ema_params = None
+    if state.ema_params is not None:
+        new_ema_params = jax.tree.map(
+            lambda old, new: ema_decay * old + (1 - ema_decay) * new, 
+            state.ema_params, 
+            new_params
+        )
+
     new_state = TrainState(
         step=state.step + 1,
         params=new_params,
         model_def=state.model_def,
         opt_state=new_opt_state,
+        ema_params=new_ema_params,
     )
 
     info = {
@@ -132,13 +174,19 @@ def save_checkpoint(state: TrainState, checkpoint_dir: Path, step: int):
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    ckpt_path = checkpoint_dir / f"step_{step:08d}"
+    # 确保使用绝对路径
+    ckpt_path = (checkpoint_dir / f"step_{step:08d}").resolve()
 
     with ocp.PyTreeCheckpointer() as ckptr:
-        ckptr.save(
-            ckpt_path,
-            {"params": state.params.to_pure_dict(), "step": step},
-        )
+        save_dict = {
+            "params": state.params.to_pure_dict(), 
+            "step": step
+        }
+        # π0优化：同时保存EMA参数
+        if state.ema_params is not None:
+            save_dict["ema_params"] = state.ema_params.to_pure_dict()
+        
+        ckptr.save(str(ckpt_path), save_dict)
 
     logging.info(f"保存 checkpoint: {ckpt_path}")
 
@@ -156,6 +204,7 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--gemma_variant", type=str, default="gemma_270m", help="Gemma 变体")
     parser.add_argument("--siglip_variant", type=str, default="So400m/14", help="SigLIP 变体")
+    parser.add_argument("--fsdp_devices", type=int, default=1, help="FSDP设备数量，>1启用模型并行")
     parser.add_argument("--load_pretrained", action="store_true", help="加载 PaliGemma 预训练权重")
     args = parser.parse_args()
 
@@ -181,7 +230,15 @@ def main():
     rng = jax.random.key(args.seed)
     train_rng, init_rng = jax.random.split(rng)
 
-    mesh = sharding.make_mesh(num_fsdp_devices=1)
+    # π0风格多GPU配置
+    logging.info(f"可用设备数: {jax.device_count()}, FSDP设备数: {args.fsdp_devices}")
+    if jax.device_count() % args.fsdp_devices != 0:
+        raise ValueError(f"设备数 {jax.device_count()} 必须能被FSDP设备数 {args.fsdp_devices} 整除")
+    
+    mesh = sharding.make_mesh(num_fsdp_devices=args.fsdp_devices)
+    logging.info(f"Mesh形状: {mesh.shape}, 轴: {mesh.axis_names}")
+    
+    # 优化后的sharding配置
     data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
@@ -191,66 +248,132 @@ def main():
     )
 
     logging.info("初始化数据加载器...")
+    # π0风格：增加batch size以提高GPU利用率
+    effective_batch_size = args.batch_size * max(1, jax.device_count() // args.fsdp_devices)
+    logging.info(f"原始batch size: {args.batch_size}, 有效batch size: {effective_batch_size}")
+    
     data_loader = ValueDataLoader(
         args.data_dir,
-        batch_size=args.batch_size,
+        batch_size=effective_batch_size,  # 使用更大的有效batch size
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=max(8, args.num_workers),  # 至少8个worker
         sharding=data_sharding,
     )
     logging.info(f"数据集大小: {len(data_loader.dataset)} 帧")
 
     logging.info("初始化模型...")
-    train_state, tx = create_train_state(config, args.learning_rate, init_rng, args.load_pretrained)
+    train_state, tx = create_train_state(config, args.num_train_steps, init_rng, args.load_pretrained)
     logging.info("模型初始化完成")
 
-    jax.tree.map(lambda _: replicated_sharding, train_state)
+    # π0风格：将模型参数分片到多GPU
+    if args.fsdp_devices > 1:
+        logging.info("应用FSDP分片到模型参数...")
+        with sharding.set_mesh(mesh):
+            train_state = jax.tree_map(
+                lambda x: sharding.apply_fsdp_sharding(mesh, x) if hasattr(x, 'shape') else x,
+                train_state,
+                is_leaf=lambda x: hasattr(x, 'shape')
+            )
+        logging.info("FSDP分片完成")
+    else:
+        # 单卡：复制到所有设备
+        train_state = jax.tree_map(lambda x: jax.device_put(x, replicated_sharding), train_state)
 
     @functools.partial(
         jax.jit,
         in_shardings=(
-            replicated_sharding,
-            replicated_sharding,
-            replicated_sharding,
-            replicated_sharding,
-            replicated_sharding,
-            data_sharding,
-            data_sharding,
+            replicated_sharding,  # params
+            replicated_sharding,  # model_def
+            replicated_sharding,  # opt_state
+            replicated_sharding,  # ema_params
+            replicated_sharding,  # step
+            replicated_sharding,  # rng
+            data_sharding,        # observation
+            data_sharding,        # target
         ),
         out_shardings=(
-            replicated_sharding,
-            replicated_sharding,
-            replicated_sharding,
-            replicated_sharding,
-            replicated_sharding,
+            replicated_sharding,  # new_params
+            replicated_sharding,  # new_model_def
+            replicated_sharding,  # new_opt_state
+            replicated_sharding,  # new_ema_params
+            replicated_sharding,  # new_step
+            replicated_sharding,  # info
         ),
-        donate_argnums=(0,),
+        # 移除donate_argnums，避免缓冲区重复使用错误
     )
-    def jit_train_step(params, model_def, opt_state, step, rng, observation, target):
-        state = TrainState(step=step, params=params, model_def=model_def, opt_state=opt_state)
+    def jit_train_step(params, model_def, opt_state, ema_params, step, rng, observation, target):
+        state = TrainState(
+            step=step, 
+            params=params, 
+            model_def=model_def, 
+            opt_state=opt_state,
+            ema_params=ema_params
+        )
         new_state, info = train_step(state, tx, rng, observation, target)
-        return new_state.params, new_state.model_def, new_state.opt_state, new_state.step, info
+        return new_state.params, new_state.model_def, new_state.opt_state, new_state.ema_params, new_state.step, info
 
-    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_dir = Path(args.checkpoint_dir).resolve()  # 确保绝对路径
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     pbar = tqdm.tqdm(range(args.num_train_steps), dynamic_ncols=True)
     infos = []
 
+    # π0风格：数据预取和GPU利用率优化
     data_iter = iter(data_loader)
+    
+    # 预取多个batch，减少GPU等待
+    logging.info("预取前几个batch以优化GPU利用率...")
+    prefetch_batches = []
+    for i in range(min(3, len(data_loader))):  # 预取3个batch
+        try:
+            batch = next(data_iter)
+            prefetch_batches.append(batch)
+        except StopIteration:
+            break
+    
+    if not prefetch_batches:
+        logging.error("无法预取任何batch，检查数据集")
+        return
+        
+    logging.info(f"成功预取 {len(prefetch_batches)} 个batch")
+
+    # JIT预热：避免首次编译的GPU空闲
+    logging.info("JIT编译预热...")
+    observation, value = prefetch_batches[0]
+    with sharding.set_mesh(mesh):
+        _ = jit_train_step(
+            train_state.params,
+            train_state.model_def,
+            train_state.opt_state,
+            train_state.ema_params,
+            train_state.step,
+            train_rng,
+            observation,
+            value,
+        )
+    logging.info("JIT编译完成，开始训练...")
+    
+    # 重新初始化数据迭代器
+    data_iter = iter(data_loader)
+    prefetch_idx = 0
 
     for step in pbar:
-        try:
-            observation, value = next(data_iter)
-        except StopIteration:
-            data_iter = iter(data_loader)
-            observation, value = next(data_iter)
-
+        # 使用预取的batch或获取新batch
+        if prefetch_idx < len(prefetch_batches):
+            observation, value = prefetch_batches[prefetch_idx]
+            prefetch_idx += 1
+        else:
+            try:
+                observation, value = next(data_iter)
+            except StopIteration:
+                data_iter = iter(data_loader)
+                observation, value = next(data_iter)
         with sharding.set_mesh(mesh):
-            new_params, new_model_def, new_opt_state, new_step, info = jit_train_step(
+            new_params, new_model_def, new_opt_state, new_ema_params, new_step, info = jit_train_step(
                 train_state.params,
                 train_state.model_def,
                 train_state.opt_state,
+                train_state.ema_params,
                 train_state.step,
                 train_rng,
                 observation,
@@ -261,6 +384,7 @@ def main():
                 params=new_params,
                 model_def=new_model_def,
                 opt_state=new_opt_state,
+                ema_params=new_ema_params,
             )
 
         infos.append(info)
@@ -268,11 +392,20 @@ def main():
         if step % args.log_interval == 0 and step > 0:
             stacked_infos = common_utils.stack_forest(infos)
             reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+            
+            # 获取当前学习率
+            current_lr = tx.learning_rate if hasattr(tx, 'learning_rate') else 'N/A'
+            if hasattr(tx, 'inner') and hasattr(tx.inner, 'learning_rate'):
+                current_lr = tx.inner.learning_rate
+            
             info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
+            pbar.write(f"Step {step}: {info_str}, lr={current_lr:.2e}" if isinstance(current_lr, (int, float)) else f"Step {step}: {info_str}")
             infos = []
 
         if step % args.save_interval == 0 and step > 0:
+            # 计算当前损失
+            current_loss = jax.device_get(info["loss"]).item()
+            logging.info(f"保存检查点 - Step {step}, Loss: {current_loss:.4f}")
             save_checkpoint(train_state, checkpoint_dir, step)
 
     save_checkpoint(train_state, checkpoint_dir, args.num_train_steps)

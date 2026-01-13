@@ -76,31 +76,41 @@ class ValueDataset(TorchDataset):
                 self.task_texts[task_index] = task_text
         
         logger.info(f"加载了 {len(self.task_texts)} 个任务文本")
+        
+        # 初始化 Gemma3 tokenizer（借鉴 Pi0 方式但使用 Gemma3）
+        self._init_gemma3_tokenizer()
+
+    def _init_gemma3_tokenizer(self):
+        """初始化 Gemma3 tokenizer（使用本地文件）"""
+        # 使用 /home/wang/data/Project1/openpi/gemma 中的 Gemma3Tokenizer
+        import sys
+        import os
+        gemma_path = os.path.join(os.path.dirname(__file__), '../../../gemma')
+        sys.path.insert(0, gemma_path)
+        
+        from gemma.gm.text._tokenizer import Gemma3Tokenizer
+        
+        # 使用本地的 tokenizer.model 文件
+        local_tokenizer_path = "/public/home/wangsenbao/Robotic_Project/checkpoint/tokenizer.model"
+        self.tokenizer = Gemma3Tokenizer(path=local_tokenizer_path)
+        logger.info(f"成功加载本地 Gemma3Tokenizer: {local_tokenizer_path}")
 
     def _tokenize_text(self, text: str) -> tuple[np.ndarray, np.ndarray]:
-        """简单的文本tokenization。"""
+        """使用 Gemma3 tokenizer 进行文本tokenization（按照 Pi0 方式）"""
         # 添加Value:后缀，明确这是价值估计任务
         text_with_suffix = f"{text}\nValue:"
-        words = text_with_suffix.lower().split()
         
-        # 简单映射到数字ID（实际应该使用真正的tokenizer）
-        vocab = {
-            'plug': 1, 'black': 2, 'into': 3, 'the': 4, 'three': 5, 'hole': 6, 'socket': 7,
-            'pull': 8, 'drawer': 9, 'open': 10, 'close': 11, 'push': 12, 'button': 13,
-            'value:': 14, '\nvalue:': 14,  # Value提示符
-            '<pad>': 0, '<unk>': 999
-        }
-        
-        tokens = [vocab.get(word, vocab['<unk>']) for word in words]
+        # 使用 Gemma3Tokenizer（和 Pi0 使用 PaliGemma tokenizer 一样的方式）
+        tokens = self.tokenizer.encode(text_with_suffix, add_bos=True, add_eos=False)
         
         # 截断或填充到固定长度
         if len(tokens) > self.max_token_len:
             tokens = tokens[:self.max_token_len]
         else:
-            tokens.extend([vocab['<pad>']] * (self.max_token_len - len(tokens)))
+            tokens.extend([0] * (self.max_token_len - len(tokens)))  # pad with 0
         
         tokens = np.array(tokens, dtype=np.int32)
-        mask = (tokens != vocab['<pad>']).astype(bool)
+        mask = (tokens != 0).astype(bool)  # 非0的都是有效token
         
         return tokens, mask
 
@@ -243,6 +253,7 @@ class ValueDataLoader:
             drop_last=True,
             pin_memory=False,                         # 避免CUDA警告
             generator=generator,                      # π0优化：固定种子
+            prefetch_factor=4 if num_workers > 0 else None,  # 修复：只在多进程时使用prefetch_factor
         )
 
         if sharding is None:
@@ -261,6 +272,10 @@ class ValueDataLoader:
 
     def __len__(self) -> int:
         return len(self._torch_loader)
+
+    def set_sharding(self, sharding: jax.sharding.Sharding):
+        """设置 sharding（在初始化后）。"""
+        self._sharding = sharding
 
     def __iter__(self) -> Iterator[tuple[_model.Observation, jnp.ndarray]]:
         for batch in self._torch_loader:

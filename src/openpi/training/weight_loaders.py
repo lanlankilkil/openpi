@@ -94,6 +94,7 @@ class ValueModelWeightLoader(WeightLoader):
 
         logger.info("加载 Gemma 3 270M 权重 (from local Orbax checkpoint)...")
         gemma_checkpoint_dir = "/public/home/wangsenbao/Robotic_Project/checkpoint/gemma-3-270m"
+        #gemma_checkpoint_dir = "/data/train_dataset/checkpoint/gemma-3-270m"
 
         # 使用 Orbax 加载 checkpoint
         try:
