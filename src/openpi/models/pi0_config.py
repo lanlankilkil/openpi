@@ -29,19 +29,31 @@ class Pi0Config(_model.BaseModelConfig):
     # - the state input is part of the discrete language tokens rather than a continuous input that is part of the suffix
     # - the action expert uses adaRMSNorm to inject the flow matching timestep
     pi05: bool = False
+    # Pi06 extends Pi05 with additional improvements for large-scale language-conditioned robot imitation
+    pi06: bool = False
+    # Whether to use fast tokenization (FAST) for discrete action tokens
+    # When True, enables CE loss for discrete token sequences including advantage indicator tokens
+    use_fast_tokenization: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
     def __post_init__(self):
         if self.max_token_len is None:
-            object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
+            if self.pi06:
+                object.__setattr__(self, "max_token_len", 256)  # Longer sequence length for Pi06
+            elif self.pi05:
+                object.__setattr__(self, "max_token_len", 200)
+            else:
+                object.__setattr__(self, "max_token_len", 48)
         if self.discrete_state_input is None:
-            object.__setattr__(self, "discrete_state_input", self.pi05)
+            object.__setattr__(self, "discrete_state_input", self.pi05 or self.pi06)
 
     @property
     @override
     def model_type(self) -> _model.ModelType:
-        if self.pi05:
+        if self.pi06:
+            return _model.ModelType.PI06
+        elif self.pi05:
             return _model.ModelType.PI05
         return _model.ModelType.PI0
 

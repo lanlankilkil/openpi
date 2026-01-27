@@ -193,7 +193,7 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
-            *data_config.model_transforms.inputs,
+            *(data_config.model_transforms.inputs if data_config.model_transforms is not None else []),
         ],
     )
 
@@ -221,7 +221,7 @@ def transform_iterable_dataset(
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
-            *data_config.model_transforms.inputs,
+            *(data_config.model_transforms.inputs if data_config.model_transforms is not None else []),
         ],
         is_batched=is_batched,
     )
@@ -468,11 +468,15 @@ class TorchDataLoader:
                 except StopIteration:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1
+                
+                # Filter batch to only keep allowed fields
+                filtered_batch = {k: v for k, v in batch.items() if k in ALLOWED_FIELDS}
+                
                 # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
                 if self._sharding is not None:
-                    yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+                    yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), filtered_batch)
                 else:
-                    yield jax.tree.map(torch.as_tensor, batch)
+                    yield jax.tree.map(torch.as_tensor, filtered_batch)
 
 
 def _collate_fn(items):
@@ -488,6 +492,20 @@ def _worker_init_fn(worker_id: int) -> None:
     # means that this approach will not work for selecting the backend.
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+
+
+# Define allowed fields that are used by the model
+# These are the fields that will be kept when converting to JAX arrays
+ALLOWED_FIELDS = {
+    "image",
+    "image_mask",
+    "state",
+    "tokenized_prompt",
+    "tokenized_prompt_mask",
+    "token_ar_mask",
+    "token_loss_mask",
+    "actions",
+}
 
 
 class RLDSDataLoader:
@@ -531,7 +549,11 @@ class RLDSDataLoader:
                 except StopIteration:
                     break  # We've exhausted the dataset. Create a new iterator and start over.
                 num_items += 1
-                yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
+                
+                # Filter batch to only keep allowed fields
+                filtered_batch = {k: v for k, v in batch.items() if k in ALLOWED_FIELDS}
+                
+                yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), filtered_batch)
 
 
 class DataLoaderImpl(DataLoader):
