@@ -1,0 +1,1 @@
+The project is located in a closed container and cannot connect to the internet. The Python environment is already configured in `/.venv/bin/python`. Each time a Python program is run, it requires `sudo /.venv/bin/python xxx.py`. The project is located at `/public/home/wangsenbao221/SothisAI`, and the root directory is `/public/home/wangsenbao221/SothisAI/openpi`.

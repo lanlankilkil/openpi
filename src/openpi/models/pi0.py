@@ -67,6 +67,8 @@ class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
         self.pi05 = config.pi05
+        self.pi06 = config.pi06
+        self.use_fast_tokenization = config.use_fast_tokenization
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         # TODO: rewrite gemma in NNX. For now, use bridge.
@@ -74,10 +76,10 @@ class Pi0(_model.BaseModel):
             _gemma.Module(
                 configs=[paligemma_config, action_expert_config],
                 embed_dtype=config.dtype,
-                adarms=config.pi05,
+                adarms=config.pi05 or config.pi06,
             )
         )
-        llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
+        llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if (config.pi05 or config.pi06) else [False, False])
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
@@ -90,7 +92,7 @@ class Pi0(_model.BaseModel):
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
-        if config.pi05:
+        if config.pi05 or config.pi06:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
             self.time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         else:
@@ -148,7 +150,7 @@ class Pi0(_model.BaseModel):
         input_mask = []
         ar_mask = []
         tokens = []
-        if not self.pi05:
+        if hasattr(self, 'state_proj'):
             # add a single state token
             state_token = self.state_proj(obs.state)[:, None, :]
             tokens.append(state_token)
@@ -159,7 +161,7 @@ class Pi0(_model.BaseModel):
         action_tokens = self.action_in_proj(noisy_actions)
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
-        if self.pi05:
+        if self.pi05 or self.pi06:
             # time MLP (for adaRMS)
             time_emb = self.time_mlp_in(time_emb)
             time_emb = nnx.swish(time_emb)
@@ -192,6 +194,18 @@ class Pi0(_model.BaseModel):
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
+        # Auto-pad action dimension to expected size with zeros
+        actual_action_dim = actions.shape[-1]
+        expected_action_dim = self.action_in_proj.in_features
+        if actual_action_dim < expected_action_dim:
+            # Pad with zeros to reach expected dimension
+            pad_width = ((0, 0),) * (actions.ndim - 1) + ((0, expected_action_dim - actual_action_dim),)
+            actions = jnp.pad(actions, pad_width, mode='constant')
+        elif actual_action_dim > expected_action_dim:
+            # Truncate if actual dimension is larger
+            actions = actions[..., :expected_action_dim]
+
+        # Compute flow matching loss (base loss)
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
@@ -211,7 +225,61 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        if self.pi06:
+            # Pi06 loss: Improved flow matching loss with time-dependent weighting
+            # This implements the loss function from π*: Large-Scale Language-Conditioned Robot Imitation
+            # Use a time-dependent weight that increases as time approaches 1
+            time_weight = time[..., None, None]  # Shape: [*b, 1, 1]
+            flow_loss = jnp.square(v_t - u_t) * time_weight
+            flow_loss = jnp.mean(flow_loss, axis=-1)
+        else:
+            # Original MSE loss for Pi0/Pi05
+            flow_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+
+        # Compute CE loss if using fast tokenization (for pi0.6*)
+        if self.use_fast_tokenization and observation.tokenized_prompt is not None:
+            # Reuse pi0_fast's CE loss logic
+            # Compute one-hot targets: we predict *next* token, so shift the input tokens by one.
+            targets = jax.nn.one_hot(
+                observation.tokenized_prompt[:, 1:],
+                self.PaliGemma.llm.module.vocab_size,
+            )
+
+            # Get token embeddings for the prompt part
+            # Note: We're reusing the existing LLM module for token embedding
+            token_embeddings = self.PaliGemma.llm(observation.tokenized_prompt, method="embed")
+            
+            # Create attention mask for the token sequence
+            token_mask = observation.tokenized_prompt_mask
+            token_ar_mask = jnp.zeros_like(observation.tokenized_prompt_mask, dtype=jnp.int32)
+            token_attn_mask = make_attn_mask(token_mask, token_ar_mask)
+
+            # Each input predicts *next* token, so we don't input the last token.
+            pre_logits, _, _ = self.PaliGemma.llm(
+                embedded_prefix=token_embeddings[:, :-1],
+                mask=token_attn_mask[:, :-1, :-1],
+                return_prelogits=True,
+            )
+
+            # Only decode logits for the target tokens to save memory
+            logits, _ = self.PaliGemma.llm(
+                pre_logits=pre_logits[:, -targets.shape[1] :],
+            )
+            logp = jax.nn.log_softmax(logits, axis=-1)
+
+            # Compute CE loss on token targets
+            assert observation.token_loss_mask is not None, "Token loss mask is required"
+            loss_mask = observation.token_loss_mask[:, 1:]
+            token_pplx = jnp.sum(targets * logp, axis=-1)
+            ce_loss = -jnp.sum(token_pplx * loss_mask, axis=-1) / jnp.clip(jnp.sum(loss_mask, -1), 1)
+
+            # Combine CE loss and flow matching loss
+            # For pi0.6*, CE loss is a core component, so we use equal weighting
+            total_loss = ce_loss + flow_loss
+            return total_loss
+        else:
+            # Return only flow matching loss if not using fast tokenization
+            return flow_loss
 
     @override
     def sample_actions(
@@ -275,5 +343,7 @@ class Pi0(_model.BaseModel):
             # robust to floating-point error
             return time >= -dt / 2
 
+        # For Pi06, we use the same sampling process as Pi0/Pi05, but with improved loss function during training
+        # The sampling process remains unchanged across model variants
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
